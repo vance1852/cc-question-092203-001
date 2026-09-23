@@ -10,7 +10,12 @@ import numpy as np
 
 from ..core.turbine import Turbine
 from ..core.wind_resource import WindResource
-from ..core.wake import WakeModel, superpose_wakes
+from ..core.wake import (
+    WakeModel,
+    wake_deficit_field,
+    wake_deficit_from_turbine,
+)
+from ..core.wake import wind_unit_vector
 
 
 @dataclass
@@ -166,53 +171,17 @@ class AEPCalculator:
         np.ndarray
             速度亏损数组 (N_turb,)，每个元素为该风机在该风向下的等效速度亏损
         """
-        n = positions.shape[0]
-
-        wind_rad = np.deg2rad(270.0 - wind_direction)
-        wind_vec = np.array([np.cos(wind_rad), np.sin(wind_rad)])
-
-        delta = positions[np.newaxis, :, :] - positions[:, np.newaxis, :]
-        distances = np.linalg.norm(delta, axis=-1)
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            delta_norm = np.where(
-                distances[..., np.newaxis] > 1e-12,
-                delta / distances[..., np.newaxis],
-                0.0,
-            )
-
-        along_wind = np.sum(delta_norm * wind_vec, axis=-1)
-
-        downstream_mask = (along_wind > 0.0) & (distances > 1e-12)
-
-        downstream_dist = np.where(downstream_mask, distances * along_wind, 0.0)
-        cross_dist = np.where(
-            downstream_mask,
-            distances * np.sqrt(np.clip(1.0 - along_wind ** 2, 0.0, 1.0)),
-            0.0,
-        )
-
-        wr = self.wake_model.wake_radius(
-            downstream_dist,
-            self._rotor_diameters[:, np.newaxis],
-        )
-
-        peak_deficit = self.wake_model.velocity_deficit(
-            downstream_dist,
-            self._rotor_diameters[:, np.newaxis],
-            self._thrust_coefficients[:, np.newaxis],
-        )
-
-        radial_factor = self.wake_model.radial_profile(cross_dist, wr)
-        deficit_matrix = peak_deficit * radial_factor
-        deficit_matrix = np.where(downstream_mask, deficit_matrix, 0.0)
-
-        total_deficit = superpose_wakes(
-            deficit_matrix,
+        # 几何投影与多机叠加统一由 wake_deficit_field 负责，
+        # 与交互明细、热力图保持同一套模型契约。
+        return wake_deficit_field(
+            self.wake_model,
+            positions,
+            positions,
+            wind_direction,
+            self._rotor_diameters,
+            self._thrust_coefficients,
             method=self.wake_superposition,
         )
-
-        return total_deficit
 
     def _compute_sector_aep(
         self,
@@ -297,8 +266,7 @@ class AEPCalculator:
         n = positions.shape[0]
         n_speed = len(self._speed_centers)
 
-        wind_rad = np.deg2rad(270.0 - wind_direction)
-        wind_vec = np.array([np.cos(wind_rad), np.sin(wind_rad)])
+        wind_vec = wind_unit_vector(wind_direction)
 
         loss_matrix = np.zeros((n, n), dtype=np.float64)
 
@@ -307,28 +275,19 @@ class AEPCalculator:
                 if i == j:
                     continue
 
-                delta = positions[j] - positions[i]
-                dist = np.linalg.norm(delta)
-                if dist <= 1e-12:
+                if np.linalg.norm(positions[j] - positions[i]) <= 1e-12:
                     continue
 
-                delta_norm = delta / dist
-                along_wind = np.dot(delta_norm, wind_vec)
-
-                if along_wind <= 0:
-                    continue
-
-                downstream_dist = dist * along_wind
-                cross_dist = dist * np.sqrt(np.clip(1.0 - along_wind ** 2, 0.0, None))
-
-                wr = self.wake_model.wake_radius(downstream_dist, self._rotor_diameters[i])
-                peak_def = self.wake_model.velocity_deficit(
-                    downstream_dist,
-                    self._rotor_diameters[i],
-                    self._thrust_coefficients[i],
+                deficit_i_on_j = float(
+                    wake_deficit_from_turbine(
+                        self.wake_model,
+                        positions[i],
+                        positions[j],
+                        wind_vec,
+                        self._rotor_diameters[i],
+                        self._thrust_coefficients[i],
+                    )
                 )
-                radial_factor = self.wake_model.radial_profile(cross_dist, wr)
-                deficit_i_on_j = peak_def * radial_factor
 
                 if deficit_i_on_j <= 0.001:
                     continue

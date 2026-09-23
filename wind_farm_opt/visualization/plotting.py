@@ -16,6 +16,7 @@ from matplotlib.colors import Normalize, LinearSegmentedColormap
 
 from ..constraints.boundary import SiteBoundary
 from ..core.wind_resource import WindResource
+from ..core.wake import wake_deficit_field, wind_unit_vector
 from ..farm.aep import FarmResult
 from ..optimization.ga import OptimizeResult
 
@@ -631,49 +632,20 @@ def plot_wake_heatmap(
     y = np.linspace(boundary.y_min, boundary.y_max, grid_resolution)
     X, Y = np.meshgrid(x, y)
 
-    wind_rad = np.deg2rad(270.0 - wind_direction)
-    wind_vec = np.array([np.cos(wind_rad), np.sin(wind_rad)])
+    wind_vec = wind_unit_vector(wind_direction)
+    grid_points = np.stack([X, Y], axis=-1)
 
-    deficit_field = np.zeros_like(X)
-
-    n_turb = positions.shape[0]
-    for i in range(n_turb):
-        pos_i = positions[i]
-
-        delta = np.stack([X - pos_i[0], Y - pos_i[1]], axis=-1)
-        dist = np.linalg.norm(delta, axis=-1)
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            delta_norm = np.where(
-                dist[..., np.newaxis] > 1e-12,
-                delta / dist[..., np.newaxis],
-                0.0,
-            )
-
-        along_wind = np.sum(delta_norm * wind_vec, axis=-1)
-        downstream_mask = (along_wind > 0.0) & (dist > 1e-12)
-
-        downstream_dist = np.where(downstream_mask, dist * along_wind, 0.0)
-        cross_dist = np.where(
-            downstream_mask,
-            dist * np.sqrt(np.clip(1.0 - along_wind ** 2, 0.0, 1.0)),
-            0.0,
-        )
-
-        wr = wake_model.wake_radius(downstream_dist, rotor_diameters[i])
-        peak_def = wake_model.velocity_deficit(
-            downstream_dist,
-            rotor_diameters[i],
-            thrust_coefficients[i],
-        )
-        radial = wake_model.radial_profile(cross_dist, wr)
-
-        deficit_i = peak_def * radial
-        deficit_i = np.where(downstream_mask, deficit_i, 0.0)
-
-        deficit_field = np.sqrt(deficit_field ** 2 + deficit_i ** 2)
-
-    deficit_field = np.clip(deficit_field, 0.0, 1.0)
+    # 几何投影与多机叠加统一由 wake_deficit_field 负责，
+    # 与 AEP 全场计算、交互明细使用同一套契约。
+    deficit_field = wake_deficit_field(
+        wake_model,
+        positions,
+        grid_points,
+        wind_direction,
+        rotor_diameters,
+        thrust_coefficients,
+        method="sum_of_squares",
+    )
 
     mask = np.zeros_like(deficit_field, dtype=bool)
     for xi in range(grid_resolution):
