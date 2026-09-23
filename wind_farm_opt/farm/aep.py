@@ -10,7 +10,11 @@ import numpy as np
 
 from ..core.turbine import Turbine
 from ..core.wind_resource import WindResource
-from ..core.wake import WakeModel, superpose_wakes
+from ..core.wake import (
+    WakeModel,
+    compute_pairwise_deficits,
+    superpose_wakes,
+)
 
 
 @dataclass
@@ -151,8 +155,8 @@ class AEPCalculator:
         self,
         positions: np.ndarray,
         wind_direction: float,
-    ) -> np.ndarray:
-        """计算给定风向下，每台风机在每个风速bin处的速度亏损。
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """计算给定风向下的尾流亏损。
 
         Parameters
         ----------
@@ -163,56 +167,25 @@ class AEPCalculator:
 
         Returns
         -------
-        np.ndarray
-            速度亏损数组 (N_turb,)，每个元素为该风机在该风向下的等效速度亏损
+        tuple[np.ndarray, np.ndarray]
+            - 每台风机承受的叠加后总速度亏损 (N_turb,)
+            - 未叠加的两两亏损矩阵 (N_upstream, N_downstream)，
+              与单对交互明细、热力图使用同一份模型契约计算
         """
-        n = positions.shape[0]
-
-        wind_rad = np.deg2rad(270.0 - wind_direction)
-        wind_vec = np.array([np.cos(wind_rad), np.sin(wind_rad)])
-
-        delta = positions[np.newaxis, :, :] - positions[:, np.newaxis, :]
-        distances = np.linalg.norm(delta, axis=-1)
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            delta_norm = np.where(
-                distances[..., np.newaxis] > 1e-12,
-                delta / distances[..., np.newaxis],
-                0.0,
-            )
-
-        along_wind = np.sum(delta_norm * wind_vec, axis=-1)
-
-        downstream_mask = (along_wind > 0.0) & (distances > 1e-12)
-
-        downstream_dist = np.where(downstream_mask, distances * along_wind, 0.0)
-        cross_dist = np.where(
-            downstream_mask,
-            distances * np.sqrt(np.clip(1.0 - along_wind ** 2, 0.0, 1.0)),
-            0.0,
+        deficit_matrix = compute_pairwise_deficits(
+            positions,
+            wind_direction,
+            self._rotor_diameters,
+            self._thrust_coefficients,
+            self.wake_model,
         )
-
-        wr = self.wake_model.wake_radius(
-            downstream_dist,
-            self._rotor_diameters[:, np.newaxis],
-        )
-
-        peak_deficit = self.wake_model.velocity_deficit(
-            downstream_dist,
-            self._rotor_diameters[:, np.newaxis],
-            self._thrust_coefficients[:, np.newaxis],
-        )
-
-        radial_factor = self.wake_model.radial_profile(cross_dist, wr)
-        deficit_matrix = peak_deficit * radial_factor
-        deficit_matrix = np.where(downstream_mask, deficit_matrix, 0.0)
 
         total_deficit = superpose_wakes(
             deficit_matrix,
             method=self.wake_superposition,
         )
 
-        return total_deficit
+        return total_deficit, deficit_matrix
 
     def _compute_sector_aep(
         self,
@@ -244,7 +217,9 @@ class AEPCalculator:
         pdf = self.wind_resource.weibull_pdf(self._speed_centers, sector_idx)
         prob = pdf * self.speed_step
 
-        total_deficit = self._compute_wake_deficit_field(positions, wind_dir)
+        total_deficit, deficit_matrix = self._compute_wake_deficit_field(
+            positions, wind_dir
+        )
 
         n_turb = len(self.turbines)
         n_speed = len(self._speed_centers)
@@ -270,8 +245,7 @@ class AEPCalculator:
         net_aep_sector = np.sum(net_power * weighting, axis=1)
 
         loss_by_source = self._compute_loss_by_source(
-            positions,
-            wind_dir,
+            deficit_matrix,
             freq,
             hours_per_year,
             prob,
@@ -281,24 +255,23 @@ class AEPCalculator:
 
     def _compute_loss_by_source(
         self,
-        positions: np.ndarray,
-        wind_direction: float,
+        deficit_matrix: np.ndarray,
         frequency: float,
         hours_per_year: float,
         prob: np.ndarray,
     ) -> np.ndarray:
         """计算每对风机之间的尾流能量损失。
 
+        亏损直接取自与全场叠加相同的 ``deficit_matrix``
+        （由 :func:`wind_farm_opt.core.wake.compute_pairwise_deficits`
+        生成），保证单机损失归因与总 AEP 使用一致的模型契约。
+
         Returns
         -------
         np.ndarray
             损失矩阵 (N_turb, N_turb)，元素 [j, i] 表示风机 i 对 j 造成的损失
         """
-        n = positions.shape[0]
-        n_speed = len(self._speed_centers)
-
-        wind_rad = np.deg2rad(270.0 - wind_direction)
-        wind_vec = np.array([np.cos(wind_rad), np.sin(wind_rad)])
+        n = deficit_matrix.shape[0]
 
         loss_matrix = np.zeros((n, n), dtype=np.float64)
 
@@ -307,28 +280,7 @@ class AEPCalculator:
                 if i == j:
                     continue
 
-                delta = positions[j] - positions[i]
-                dist = np.linalg.norm(delta)
-                if dist <= 1e-12:
-                    continue
-
-                delta_norm = delta / dist
-                along_wind = np.dot(delta_norm, wind_vec)
-
-                if along_wind <= 0:
-                    continue
-
-                downstream_dist = dist * along_wind
-                cross_dist = dist * np.sqrt(np.clip(1.0 - along_wind ** 2, 0.0, None))
-
-                wr = self.wake_model.wake_radius(downstream_dist, self._rotor_diameters[i])
-                peak_def = self.wake_model.velocity_deficit(
-                    downstream_dist,
-                    self._rotor_diameters[i],
-                    self._thrust_coefficients[i],
-                )
-                radial_factor = self.wake_model.radial_profile(cross_dist, wr)
-                deficit_i_on_j = peak_def * radial_factor
+                deficit_i_on_j = float(deficit_matrix[i, j])
 
                 if deficit_i_on_j <= 0.001:
                     continue
@@ -475,7 +427,7 @@ class AEPCalculator:
             pdf = self.wind_resource.weibull_pdf(self._speed_centers, s_idx)
             prob = pdf * self.speed_step
 
-            total_deficit = self._compute_wake_deficit_field(positions, wind_dir)
+            total_deficit, _ = self._compute_wake_deficit_field(positions, wind_dir)
 
             effective_speeds = self._speed_centers[np.newaxis, :] * (1.0 - total_deficit[:, np.newaxis])
 

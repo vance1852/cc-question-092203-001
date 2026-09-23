@@ -16,6 +16,7 @@ from matplotlib.colors import Normalize, LinearSegmentedColormap
 
 from ..constraints.boundary import SiteBoundary
 from ..core.wind_resource import WindResource
+from ..core.wake import compute_deficit_field
 from ..farm.aep import FarmResult
 from ..optimization.ga import OptimizeResult
 
@@ -634,46 +635,19 @@ def plot_wake_heatmap(
     wind_rad = np.deg2rad(270.0 - wind_direction)
     wind_vec = np.array([np.cos(wind_rad), np.sin(wind_rad)])
 
-    deficit_field = np.zeros_like(X)
-
-    n_turb = positions.shape[0]
-    for i in range(n_turb):
-        pos_i = positions[i]
-
-        delta = np.stack([X - pos_i[0], Y - pos_i[1]], axis=-1)
-        dist = np.linalg.norm(delta, axis=-1)
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            delta_norm = np.where(
-                dist[..., np.newaxis] > 1e-12,
-                delta / dist[..., np.newaxis],
-                0.0,
-            )
-
-        along_wind = np.sum(delta_norm * wind_vec, axis=-1)
-        downstream_mask = (along_wind > 0.0) & (dist > 1e-12)
-
-        downstream_dist = np.where(downstream_mask, dist * along_wind, 0.0)
-        cross_dist = np.where(
-            downstream_mask,
-            dist * np.sqrt(np.clip(1.0 - along_wind ** 2, 0.0, 1.0)),
-            0.0,
-        )
-
-        wr = wake_model.wake_radius(downstream_dist, rotor_diameters[i])
-        peak_def = wake_model.velocity_deficit(
-            downstream_dist,
-            rotor_diameters[i],
-            thrust_coefficients[i],
-        )
-        radial = wake_model.radial_profile(cross_dist, wr)
-
-        deficit_i = peak_def * radial
-        deficit_i = np.where(downstream_mask, deficit_i, 0.0)
-
-        deficit_field = np.sqrt(deficit_field ** 2 + deficit_i ** 2)
-
-    deficit_field = np.clip(deficit_field, 0.0, 1.0)
+    # 网格亏损与单对交互、AEP 共用同一份模型契约
+    # (compute_deficit_field -> superpose_wakes)，避免图形计算
+    # 自行实现几何/叠加导致与数值结果不一致。
+    grid_points = np.column_stack([X.ravel(), Y.ravel()])
+    deficit_flat = compute_deficit_field(
+        points=grid_points,
+        positions=positions,
+        wind_direction=wind_direction,
+        rotor_diameters=rotor_diameters,
+        thrust_coefficients=thrust_coefficients,
+        wake_model=wake_model,
+    )
+    deficit_field = deficit_flat.reshape(X.shape)
 
     mask = np.zeros_like(deficit_field, dtype=bool)
     for xi in range(grid_resolution):
